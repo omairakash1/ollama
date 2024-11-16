@@ -599,6 +599,9 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	request := api.PushRequest{Name: args[0], Insecure: insecure}
+
+	n := model.ParseName(args[0])
+	isOllamaHost := strings.HasSuffix(n.Host, ".ollama.ai") || strings.HasSuffix(n.Host, ".ollama.com")
 	if err := client.Push(cmd.Context(), &request, fn); err != nil {
 		if spinner != nil {
 			spinner.Stop()
@@ -606,8 +609,6 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 		if strings.Contains(err.Error(), "access denied") {
 			return errors.New("you are not authorized to push to this namespace, create the model under a namespace you own")
 		}
-		host := model.ParseName(args[0]).Host
-		isOllamaHost := strings.HasSuffix(host, ".ollama.ai") || strings.HasSuffix(host, ".ollama.com")
 		if strings.Contains(err.Error(), errtypes.UnknownOllamaKeyErrMsg) && isOllamaHost {
 			// the user has not added their ollama key to ollama.com
 			// re-throw an error with a more user-friendly message
@@ -617,7 +618,15 @@ func PushHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	p.Stop()
 	spinner.Stop()
+
+	destination := n.String()
+	if isOllamaHost {
+		destination = "https://ollama.com/" + strings.TrimSuffix(n.DisplayShortest(), ":latest")
+	}
+	fmt.Printf("\nModel pushed → %s\n", destination)
+
 	return nil
 }
 
