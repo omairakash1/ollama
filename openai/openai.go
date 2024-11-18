@@ -32,7 +32,7 @@ type ErrorResponse struct {
 }
 
 type Message struct {
-	Role      string     `json:"role"`
+	Role      string     `json:"role,omitempty"`
 	Content   any        `json:"content"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
@@ -252,7 +252,7 @@ func toChunk(id string, r api.ChatResponse) ChatCompletionChunk {
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
 			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content},
+			Delta: Message{Content: r.Message.Content},
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
 					return &reason
@@ -546,8 +546,9 @@ type BaseWriter struct {
 }
 
 type ChatWriter struct {
-	stream bool
-	id     string
+	stream  bool
+	started bool
+	id      string
 	BaseWriter
 }
 
@@ -588,15 +589,40 @@ func (w *BaseWriter) writeError(code int, data []byte) (int, error) {
 }
 
 func (w *ChatWriter) writeResponse(data []byte) (int, error) {
-	var chatResponse api.ChatResponse
-	err := json.Unmarshal(data, &chatResponse)
+	var cr api.ChatResponse
+	err := json.Unmarshal(data, &cr)
 	if err != nil {
 		return 0, err
 	}
 
-	// chat chunk
 	if w.stream {
-		d, err := json.Marshal(toChunk(w.id, chatResponse))
+		if !w.started {
+			first := ChatCompletionChunk{
+				Id:                w.id,
+				Object:            "chat.completion.chunk",
+				Created:           time.Now().Unix(),
+				Model:             cr.Model,
+				SystemFingerprint: "fp_ollama",
+				Choices: []ChunkChoice{{
+					Index: 0,
+					Delta: Message{Role: "assistant", Content: ""},
+				}},
+			}
+			d, err := json.Marshal(first)
+			if err != nil {
+				return 0, err
+			}
+
+			w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+			_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+			if err != nil {
+				return 0, err
+			}
+
+			w.started = true
+		}
+
+		d, err := json.Marshal(toChunk(w.id, cr))
 		if err != nil {
 			return 0, err
 		}
@@ -607,7 +633,7 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			return 0, err
 		}
 
-		if chatResponse.Done {
+		if cr.Done {
 			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
 			if err != nil {
 				return 0, err
@@ -617,9 +643,8 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 		return len(data), nil
 	}
 
-	// chat completion
 	w.ResponseWriter.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, chatResponse))
+	err = json.NewEncoder(w.ResponseWriter).Encode(toChatCompletion(w.id, cr))
 	if err != nil {
 		return 0, err
 	}
