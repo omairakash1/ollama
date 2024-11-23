@@ -1,170 +1,118 @@
 #!/usr/bin/env python3
 import os
-import glob
-from typing import List
-from multiprocessing import Pool
-from tqdm import tqdm
-
-from langchain.document_loaders import (
-    CSVLoader,
-    EverNoteLoader,
-    PyMuPDFLoader,
-    TextLoader,
-    UnstructuredEmailLoader,
-    UnstructuredEPubLoader,
-    UnstructuredHTMLLoader,
-    UnstructuredMarkdownLoader,
-    UnstructuredODTLoader,
-    UnstructuredPowerPointLoader,
-    UnstructuredWordDocumentLoader,
-)
+import logging
+import pickle
+import faiss
+import torch
+import glob  # Import glob for file path matching
+from typing import List, Dict
+from transformers import AutoTokenizer, AutoModel
+from langchain_community.document_loaders import TextLoader, PyMuPDFLoader, UnstructuredMarkdownLoader
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.docstore.document import Document
-from constants import CHROMA_SETTINGS
+from tqdm import tqdm
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Load environment variables
-persist_directory = os.environ.get('PERSIST_DIRECTORY', 'db')
-source_directory = os.environ.get('SOURCE_DIRECTORY', 'source_documents')
-embeddings_model_name = os.environ.get('EMBEDDINGS_MODEL_NAME', 'all-MiniLM-L6-v2')
+# Constants
+persist_directory = os.environ.get("PERSIST_DIRECTORY", "db")
+source_directory = os.environ.get("SOURCE_DIRECTORY", "source_documents")
+embeddings_model_name = os.environ.get("EMBEDDINGS_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 chunk_size = 500
 chunk_overlap = 50
 
-# Custom document loaders
-class MyElmLoader(UnstructuredEmailLoader):
-    """Wrapper to fallback to text/plain when default does not work"""
-
-    def load(self) -> List[Document]:
-        """Wrapper adding fallback for elm without html"""
-        try:
-            try:
-                doc = UnstructuredEmailLoader.load(self)
-            except ValueError as e:
-                if 'text/html content not found in email' in str(e):
-                    # Try plain text
-                    self.unstructured_kwargs["content_source"]="text/plain"
-                    doc = UnstructuredEmailLoader.load(self)
-                else:
-                    raise
-        except Exception as e:
-            # Add file_path to exception message
-            raise type(e)(f"{self.file_path}: {e}") from e
-
-        return doc
-
-
-# Map file extensions to document loaders and their arguments
+# Document loader mapping
 LOADER_MAPPING = {
-    ".csv": (CSVLoader, {}),
-    # ".docx": (Docx2txtLoader, {}),
-    ".doc": (UnstructuredWordDocumentLoader, {}),
-    ".docx": (UnstructuredWordDocumentLoader, {}),
-    ".enex": (EverNoteLoader, {}),
-    ".eml": (MyElmLoader, {}),
-    ".epub": (UnstructuredEPubLoader, {}),
-    ".html": (UnstructuredHTMLLoader, {}),
-    ".md": (UnstructuredMarkdownLoader, {}),
-    ".odt": (UnstructuredODTLoader, {}),
-    ".pdf": (PyMuPDFLoader, {}),
-    ".ppt": (UnstructuredPowerPointLoader, {}),
-    ".pptx": (UnstructuredPowerPointLoader, {}),
-    ".txt": (TextLoader, {"encoding": "utf8"}),
-    # Add more mappings for other file extensions and loaders as needed
+    ".txt": TextLoader,
+    ".md": UnstructuredMarkdownLoader,
+    ".pdf": PyMuPDFLoader,
 }
 
-
-def load_single_document(file_path: str) -> List[Document]:
-    if os.path.getsize(file_path) != 0:
-        filename, ext = os.path.splitext(file_path)
-        if ext in LOADER_MAPPING:
-            loader_class, loader_args = LOADER_MAPPING[ext]
+def load_documents(source_dir: str) -> List[str]:
+    """Load all documents using LangChain loaders."""
+    documents = []
+    for ext, loader_class in LOADER_MAPPING.items():
+        file_paths = glob.glob(os.path.join(source_dir, f"**/*{ext}"), recursive=True)
+        for file_path in file_paths:
             try:
-                loader = loader_class(file_path, **loader_args)
-                if loader:
-                    return loader.load()
-            except:
-                print(f"Corrupted file {file_path}. Ignoring it.")
-        else:
-            print(f"Unsupported file {file_path}. Ignoring it.")
-    else:
-        print(f"Empty file {file_path}. Ignoring it.")
+                loader = loader_class(file_path)
+                docs = loader.load()
+                documents.extend(docs)
+            except Exception as e:
+                logging.error(f"Failed to load {file_path}: {e}")
+    return documents
 
-
-def load_documents(source_dir: str, ignored_files: List[str] = []) -> List[Document]:
-    """
-    Loads all documents from the source documents directory, ignoring specified files
-    """
-    all_files = []
-    for ext in LOADER_MAPPING:
-        all_files.extend(
-            glob.glob(os.path.join(source_dir, f"**/*{ext}"), recursive=True)
-        )
-    filtered_files = [file_path for file_path in all_files if file_path not in ignored_files]
-
-    with Pool(processes=os.cpu_count()) as pool:
-        results = []
-        with tqdm(total=len(filtered_files), desc='Loading new documents', ncols=80) as pbar:
-            for i, docs in enumerate(pool.imap_unordered(load_single_document, filtered_files)):
-                if docs:
-                    results.extend(docs)
-                pbar.update()
-
-    return results
-
-def process_documents(ignored_files: List[str] = []) -> List[Document]:
-    """
-    Load documents and split in chunks
-    """
-    print(f"Loading documents from {source_directory}")
-    documents = load_documents(source_directory, ignored_files)
-    if not documents:
-        print("No new documents to load")
-        exit(0)
-    print(f"Loaded {len(documents)} new documents from {source_directory}")
+def split_documents(documents: List[str]) -> List[Dict]:
+    """Split documents into chunks using LangChain's text splitter."""
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    texts = text_splitter.split_documents(documents)
-    print(f"Split into {len(texts)} chunks of text (max. {chunk_size} tokens each)")
-    return texts
+    chunks = []
+    metadata = []
+    for i, doc in enumerate(documents):
+        doc_chunks = text_splitter.split_text(doc.page_content)
+        chunks.extend(doc_chunks)
+        metadata.extend([{"doc_id": i, "chunk_id": j, "source": doc.metadata} for j in range(len(doc_chunks))])
+    return chunks, metadata
 
-def does_vectorstore_exist(persist_directory: str) -> bool:
-    """
-    Checks if vectorstore exists
-    """
-    if os.path.exists(os.path.join(persist_directory, 'index')):
-        if os.path.exists(os.path.join(persist_directory, 'chroma-collections.parquet')) and os.path.exists(os.path.join(persist_directory, 'chroma-embeddings.parquet')):
-            list_index_files = glob.glob(os.path.join(persist_directory, 'index/*.bin'))
-            list_index_files += glob.glob(os.path.join(persist_directory, 'index/*.pkl'))
-            # At least 3 documents are needed in a working vectorstore
-            if len(list_index_files) > 3:
-                return True
-    return False
+def create_embeddings(model_name: str):
+    """Load Hugging Face model and tokenizer for embedding generation."""
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.eval()
+    return tokenizer, model
+
+def embed_texts(texts: List[str], tokenizer, model, batch_size=16) -> torch.Tensor:
+    """Generate embeddings for a list of texts using Hugging Face."""
+    embeddings = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
+        batch = texts[i:i + batch_size]
+        tokens = tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
+        with torch.no_grad():
+            outputs = model(**tokens)
+            embeddings.append(outputs.last_hidden_state.mean(dim=1))
+    return torch.cat(embeddings, dim=0)
+
+def save_vectorstore(vectors: torch.Tensor, metadata: List[Dict], persist_directory: str):
+    """Save FAISS index and metadata."""
+    if not os.path.exists(persist_directory):
+        os.makedirs(persist_directory)
+    
+    # Save vectors using FAISS
+    index = faiss.IndexFlatL2(vectors.size(1))
+    index.add(vectors.numpy())
+    faiss.write_index(index, os.path.join(persist_directory, "index.faiss"))
+    
+    # Save metadata as a pickle file
+    with open(os.path.join(persist_directory, "metadata.pkl"), "wb") as f:
+        pickle.dump(metadata, f)
+
+def load_vectorstore(persist_directory: str):
+    """Load FAISS index and metadata."""
+    index = faiss.read_index(os.path.join(persist_directory, "index.faiss"))
+    with open(os.path.join(persist_directory, "metadata.pkl"), "rb") as f:
+        metadata = pickle.load(f)
+    return index, metadata
 
 def main():
+    logging.info(f"Loading documents from {source_directory}")
+    
+    # Load and split documents
+    raw_documents = load_documents(source_directory)
+    if not raw_documents:
+        logging.info("No documents found.")
+        return
+    
+    logging.info(f"Loaded {len(raw_documents)} documents.")
+    chunks, metadata = split_documents(raw_documents)
+    logging.info(f"Generated {len(chunks)} text chunks.")
+
     # Create embeddings
-    embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name)
+    tokenizer, model = create_embeddings(embeddings_model_name)
+    vectors = embed_texts(chunks, tokenizer, model)
 
-    if does_vectorstore_exist(persist_directory):
-        # Update and store locally vectorstore
-        print(f"Appending to existing vectorstore at {persist_directory}")
-        db = Chroma(persist_directory=persist_directory, embedding_function=embeddings, client_settings=CHROMA_SETTINGS)
-        collection = db.get()
-        texts = process_documents([metadata['source'] for metadata in collection['metadatas']])
-        print(f"Creating embeddings. May take some minutes...")
-        db.add_documents(texts)
-    else:
-        # Create and store locally vectorstore
-        print("Creating new vectorstore")
-        texts = process_documents()
-        print(f"Creating embeddings. May take some minutes...")
-        db = Chroma.from_documents(texts, embeddings, persist_directory=persist_directory)
-    db.persist()
-    db = None
-
-    print(f"Ingestion complete! You can now run privateGPT.py to query your documents")
-
+    # Save vectorstore
+    save_vectorstore(vectors, metadata, persist_directory)
+    logging.info("Vectorstore updated successfully.")
 
 if __name__ == "__main__":
     main()

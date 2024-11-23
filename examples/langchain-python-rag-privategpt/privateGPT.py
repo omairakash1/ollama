@@ -1,81 +1,112 @@
 #!/usr/bin/env python3
-from langchain.chains import RetrievalQA
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-from langchain.vectorstores import Chroma
-from langchain.llms import Ollama
-from langchain import PromptTemplate
-import chromadb
 import os
 import argparse
 import time
+import faiss
+import pickle
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from tqdm import tqdm
 
-model = os.environ.get("MODEL", "llama3.2:1b")
-embeddings_model_name = os.environ.get("EMBEDDINGS_MODEL_NAME", "all-MiniLM-L6-v2")
+# Environment variables and constants
+model_name = os.environ.get("MODEL", "gpt2")  # Replace with desired Hugging Face model
+embeddings_model_name = os.environ.get("EMBEDDINGS_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 persist_directory = os.environ.get("PERSIST_DIRECTORY", "db")
 target_source_chunks = int(os.environ.get('TARGET_SOURCE_CHUNKS', 4))
 
-from constants import CHROMA_SETTINGS
+def load_vectorstore(persist_directory: str):
+    """Load FAISS index and metadata."""
+    index_path = os.path.join(persist_directory, "index.faiss")
+    metadata_path = os.path.join(persist_directory, "metadata.pkl")
+
+    if not os.path.exists(index_path) or not os.path.exists(metadata_path):
+        raise ValueError("Persisted vectorstore not found. Please build it first.")
+    
+    index = faiss.read_index(index_path)
+    with open(metadata_path, "rb") as f:
+        metadata = pickle.load(f)
+    
+    return index, metadata
+
+def query_vectorstore(index, metadata, query_embedding, k=4):
+    """Query FAISS index for nearest neighbors."""
+    distances, indices = index.search(query_embedding, k)
+    results = [{"content": metadata[i]["content"], "source": metadata[i]["source"]} for i in indices[0] if i != -1]
+    return results
+
+def generate_embeddings(texts, tokenizer, model, batch_size=16):
+    """Generate embeddings using Hugging Face models."""
+    embeddings = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
+        batch = texts[i:i+batch_size]
+        tokens = tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
+        with torch.no_grad():
+            outputs = model(**tokens)
+            embeddings.append(outputs.last_hidden_state.mean(dim=1).numpy())
+    return np.vstack(embeddings)
 
 def main():
-    # Parse the command line arguments
+    # Parse arguments
     args = parse_arguments()
-    
-    # Initialize the embeddings and vector store
-    embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name)
-    db = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
 
-    # Set up retriever with search configuration
-    retriever = db.as_retriever(search_kwargs={"k": target_source_chunks})
+    # Load vectorstore
+    index, metadata = load_vectorstore(persist_directory)
 
-    # Activate/deactivate the streaming StdOut callback for LLMs
-    callbacks = [] if args.mute_stream else [StreamingStdOutCallbackHandler()]
+    # Load Hugging Face model for embeddings
+    tokenizer = AutoTokenizer.from_pretrained(embeddings_model_name)
+    embeddings_model = AutoModelForCausalLM.from_pretrained(embeddings_model_name)
+    embeddings_model.eval()
 
-    # Initialize LLM model (Ollama)
-    llm = Ollama(model=model, callbacks=callbacks)
+    # Load Hugging Face pipeline for text generation
+    generator = pipeline("text-generation", model=model_name)
 
-    # Define a template for the QA prompt
-    template = """
-    Given the context below, extract the following details and present them in a single, well-organized paragraph. Ensure the information is written cohesively as if it came from one source. If any detail is missing, respond with "Not available." The answer should flow naturally, with proper sentence structure:
-    - Store Type
-    - Store Offerings
-    - Store Size
+    print("Vectorstore loaded. Ready for queries!")
 
-    Context: {context}
-    Answer:"""
-    prompt_template = PromptTemplate(input_variables=["context", "question"], template=template)
-
-    # Create the QA chain with the customized prompt
-    qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=not args.hide_source, chain_type_kwargs={"prompt": prompt_template})
-
-    # Interactive questions and answers
+    # Interactive loop
     while True:
-        query = input("\nEnter a query: ")
-        if query == "exit":
+        query = input("\nEnter a query (or type 'exit' to quit): ")
+        if query.lower() == "exit":
             break
-        if query.strip() == "":
+        if not query.strip():
             continue
 
-        # Get the answer from the chain using the query and context
-        start = time.time()
-        res = qa({"query": query})
-        answer, docs = res['result'], [] if args.hide_source else res['source_documents']
-        end = time.time()
+        # Generate query embedding
+        query_tokens = tokenizer([query], padding=True, truncation=True, return_tensors="pt", max_length=512)
+        with torch.no_grad():
+            query_embedding = embeddings_model(**query_tokens).last_hidden_state.mean(dim=1).numpy()
 
-        # Print the result
+        # Query the vectorstore
+        results = query_vectorstore(index, metadata, query_embedding, k=target_source_chunks)
+
+        # Combine context from retrieved documents
+        context = " ".join([result["content"] for result in results])
+
+        # Generate response
+        prompt = f"""
+        Given the context below, extract the following details and present them in a single, well-organized paragraph:
+        - Store Type
+        - Store Offerings
+        - Store Size
+
+        Context: {context}
+        Answer:
+        """
+        response = generator(prompt, max_length=300, num_return_sequences=1)[0]["generated_text"]
+
+        # Output response
         print("\n\n> Question:")
         print(query)
-        print(answer)
+        print("\n> Answer:")
+        print(response)
 
-        # Print the relevant sources used for the answer
-        #for document in docs:
-            #print("\n> " + document.metadata["source"] + ":")
-        #    print(document.page_content)
+        # Optionally print sources
+        if not args.hide_source:
+            print("\n> Sources:")
+            for result in results:
+                print(f"- {result['source']}")
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Ask questions to your documents using LLMs.')
     parser.add_argument("--hide-source", "-S", action='store_true', help='Disable printing of source documents.')
-    parser.add_argument("--mute-stream", "-M", action='store_true', help='Disable the streaming callback for LLMs.')
     return parser.parse_args()
 
 if __name__ == "__main__":
