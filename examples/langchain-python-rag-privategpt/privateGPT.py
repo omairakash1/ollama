@@ -36,11 +36,13 @@ def main():
 
     # Define a template for the QA prompt
     template = """
-    Given the context below, answer the question at the end as concisely and coherent as possible. If unsure, simply say "I don't know".
+    Given the context below, extract the following details and present them in a single, well-organized paragraph. Ensure the information is written cohesively as if it came from one source. If any detail is missing, respond with "Not available." The answer should flow naturally, with proper sentence structure:
+    - Store Type
+    - Store Offerings
+    - Store Size
+
     Context: {context}
-    Question: {question}
     Answer:"""
-    
     prompt_template = PromptTemplate(input_variables=["context", "question"], template=template)
 
     # Create the QA chain with the customized prompt
@@ -66,9 +68,9 @@ def main():
         print(answer)
 
         # Print the relevant sources used for the answer
-        for document in docs:
-            print("\n> " + document.metadata["source"] + ":")
-            print(document.page_content)
+        #for document in docs:
+            #print("\n> " + document.metadata["source"] + ":")
+        #    print(document.page_content)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Ask questions to your documents using LLMs.')
