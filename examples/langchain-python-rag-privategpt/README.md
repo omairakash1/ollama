@@ -9,8 +9,7 @@ https://github.com/ollama/ollama/assets/3325447/20cf8ec6-ff25-42c6-bdd8-9be594e3
 Set up a virtual environment (optional):
 
 ```
-python3 -m venv .venv
-source .venv/bin/activate
+cd .vene
 ```
 
 Install the Python dependencies:
