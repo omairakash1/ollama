@@ -1,122 +1,118 @@
-#!/usr/bin/env python3
-import os
-import argparse
-import time
 import faiss
-import pickle
-import torch
 import numpy as np
-from transformers import AutoModel, AutoTokenizer, pipeline
-from tqdm import tqdm
+from langchain_community.document_loaders import UnstructuredPDFLoader
+from langchain.text_splitter import CharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+from nltk.tokenize import PunktTokenizer
+import nltk
 
-# Environment variables and constants
-model_name = os.environ.get("MODEL", "meta-llama/Llama-3.2-1B-Instruct")  # Replace with desired Hugging Face model
-embeddings_model_name = os.environ.get("EMBEDDINGS_MODEL_NAME", "sentence-transformers/multi-qa-MiniLM-L6-cos-v1")
-persist_directory = os.environ.get("PERSIST_DIRECTORY", "db")
-target_source_chunks = int(os.environ.get('TARGET_SOURCE_CHUNKS', 4))
+# Step 1: Load and Preprocess PDF Documents
+def load_and_preprocess_pdfs(pdf_paths):
+    """
+    Loads and preprocesses PDF documents, splitting them into manageable chunks.
+    """
+    all_documents = []
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 
+    for path in pdf_paths:
+        loader = UnstructuredPDFLoader(path)
+        documents = loader.load()
+        chunks = text_splitter.split_documents(documents)
+        all_documents.extend(chunks)
 
-def load_vectorstore(persist_directory: str):
-    """Load FAISS index and metadata."""
-    index_path = os.path.join(persist_directory, "index.faiss")
-    metadata_path = os.path.join(persist_directory, "metadata.pkl")
+    return all_documents
 
-    if not os.path.exists(index_path) or not os.path.exists(metadata_path):
-        raise ValueError("Persisted vectorstore not found. Please build it first.")
-    
-    index = faiss.read_index(index_path)
-    with open(metadata_path, "rb") as f:
-        metadata = pickle.load(f)
-    
-    return index, metadata
+# Step 2: Embed and Index Documents
+def embed_and_index_documents(documents, embedding_model):
+    """
+    Embeds text documents and creates a FAISS index for similarity search.
+    """
+    texts = [doc.page_content for doc in documents]
+    embeddings = embedding_model.encode(texts, convert_to_tensor=False)
 
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(np.array(embeddings, dtype=np.float32))
+    return index, texts
 
-def query_vectorstore(query: str, model, tokenizer, index, metadata, top_k=5):
-    """Search the FAISS index using query embeddings."""
-    query_tokens = tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
-    with torch.no_grad():
-        # Generate embeddings
-        query_embedding = model(**query_tokens).pooler_output  # Use pooler_output for embeddings
-    query_embedding = query_embedding.numpy()
-
-    # Perform FAISS search
-    distances, indices = index.search(query_embedding, top_k)
-    results = [{"distance": d, "metadata": metadata[i]} for d, i in zip(distances[0], indices[0])]
+# Step 3: Search FAISS Index
+def search_faiss_index(query, index, texts, embedding_model, top_k=5):
+    """
+    Searches the FAISS index for the most relevant documents based on the query.
+    """
+    query_embedding = embedding_model.encode([query], convert_to_tensor=False)
+    distances, indices = index.search(np.array(query_embedding, dtype=np.float32), top_k)
+    results = [{"content": texts[i], "distance": distances[0][j]} for j, i in enumerate(indices[0])]
     return results
 
+# Step 4: Generate Answer Using LLM
+from transformers import AutoTokenizer
 
-def generate_embeddings(texts, tokenizer, model, batch_size=16):
-    """Generate embeddings for a list of texts."""
-    embeddings = []
-    for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
-        batch = texts[i:i + batch_size]
-        tokens = tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
-        with torch.no_grad():
-            outputs = model(**tokens)
-            embeddings.append(outputs.pooler_output.numpy())  # Use pooler_output
-    return np.vstack(embeddings)
+def generate_answer(query, context, generator):
+    """
+    Generates an answer using the retrieved context and query.
+    """
+    # Load tokenizer for the model
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
+    # Construct the prompt
+    prompt = f"""
+    Context:
+    {context}
 
-def main():
-    # Parse arguments
-    args = parse_arguments()
+    Query:
+    {query}
 
-    # Load vectorstore
-    index, metadata = load_vectorstore(persist_directory)
+    Answer:
+    """
 
-    # Load Hugging Face model for embeddings
-    tokenizer = AutoTokenizer.from_pretrained(embeddings_model_name)
-    embeddings_model = AutoModel.from_pretrained(embeddings_model_name)
-    embeddings_model.eval()
+    # Tokenize and truncate the input if it exceeds the model's limit
+    input_ids = tokenizer(prompt, truncation=True, max_length=900, return_tensors="pt")["input_ids"]
 
-    # Load Hugging Face pipeline for text generation
-    generator = pipeline("text-generation", model=model_name)
-
-    print("Vectorstore loaded. Ready for queries!")
-
-    # Interactive loop
-    while True:
-        query = input("\nEnter a query (or type 'exit' to quit): ")
-        if query.lower() == "exit":
-            break
-        if not query.strip():
-            continue
-
-        # Query the vectorstore
-        results = query_vectorstore(query, embeddings_model, tokenizer, index, metadata, top_k=target_source_chunks)
-
-        # Combine context from retrieved documents
-        context = " ".join([result["metadata"].get("content", "") for result in results])
-
-        # Generate response
-        prompt = f"""
-        Given the context below, extract the following details and present them in a single, well-organized paragraph:
-        - Store Type
-        - Store Offerings
-        - Store Size
-
-        Context: {context}
-        Answer:
-        """
-        response = generator(prompt, max_length=300, num_return_sequences=1)[0]["generated_text"]
-
-        # Output response
-        print("\n\n> Question:")
-        print(query)
-        print("\n> Answer:")
-        print(response)
-
-        # Optionally print sources
-        if not args.hide_source:
-            print("\n> Sources:")
-            for result in results:
-                print(f"- {result['metadata'].get('source', 'Unknown')}")
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Ask questions to your documents using LLMs.')
-    parser.add_argument("--hide-source", "-S", action='store_true', help='Disable printing of source documents.')
-    return parser.parse_args()
+    # Generate response with the remaining token budget
+    response = generator(
+        tokenizer.decode(input_ids[0], skip_special_tokens=True), 
+        max_new_tokens=100,  # Allows for 100 tokens to be generated
+        num_return_sequences=1
+    )
+    return response[0]["generated_text"]
 
 
+# Step 5: Full Pipeline Integration
+def main(pdf_paths, query):
+    """
+    Integrates all steps into a single pipeline to process PDFs, retrieve relevant data, 
+    and generate an answer for the query.
+    """
+    # Load documents
+    print("Loading and preprocessing PDF documents...")
+    documents = load_and_preprocess_pdfs(pdf_paths)
+
+    # Initialize embedding model
+    print("Initializing embedding model...")
+    embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    # Embed and index documents
+    print("Embedding and indexing documents...")
+    index, texts = embed_and_index_documents(documents, embedding_model)
+
+    # Retrieve relevant documents
+    print("Searching FAISS index...")
+    results = search_faiss_index(query, index, texts, embedding_model)
+    
+    # Generate response
+    print("Generating response...")
+    context = " ".join([result["content"] for result in results])
+    generator = pipeline("text-generation", model="gpt2")
+    answer = generate_answer(query, context, generator)
+
+    return answer
+
+# Example Usage
 if __name__ == "__main__":
-    main()
+    nltk.download('punkt', download_dir='E:/')
+    pdf_paths = ["E:/Client Background Information.pdf"]
+    query = "What are the key points discussed in the documents?"
+    answer = main(pdf_paths, query)
+    print("\nGenerated Answer:")
+    print(answer)
